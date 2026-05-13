@@ -7,10 +7,17 @@ from __future__ import annotations
 
 import base64
 import os
+import sys
 import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
+
+# Streamlit Cloud など `pip install -e .` を実行しない環境でも
+# zengin_converter をインポートできるように src/ を sys.path に追加する
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
 import streamlit as st
 import streamlit.components.v1 as components
