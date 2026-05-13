@@ -945,7 +945,7 @@ def render_convert_tab() -> None:
 
     if st.session_state["extracted_items"]:
         st.markdown(
-            f"**抽出済み: {len(st.session_state["extracted_items"])}件**　— "
+            f"**抽出済み: {len(st.session_state['extracted_items'])}件**　— "
             "下記の一覧またはプレビュー横のフォームで修正できます。"
         )
 
