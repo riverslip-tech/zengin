@@ -159,7 +159,7 @@ def list_batches(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     cur = conn.execute(
         """
         SELECT
-            b.batch_id, b.name, b.transfer_date, b.transfer_type,
+            b.batch_id, b.name, b.transfer_date, b.transfer_type, b.consignor_id,
             b.created_at, b.updated_at,
             COUNT(i.item_id) AS item_count,
             COALESCE(SUM(i.amount), 0) AS total_amount
