@@ -1,0 +1,28 @@
+[project]
+name = "zengin-converter"
+version = "0.1.0"
+description = "請求書PDFを読み込んで全銀フォーマットに変換するツール"
+requires-python = ">=3.10"
+dependencies = [
+    "pymupdf>=1.24.0",
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0.0",
+    "anthropic>=0.40.0",
+    "pydantic>=2.0.0",
+    "zengin-code>=0.3.0",
+    "jaconv>=0.4.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+zengin-converter = "zengin_converter.main:main"
+
+[project.gui-scripts]
+zengin-gui = "zengin_converter.gui:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

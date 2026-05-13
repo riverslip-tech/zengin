@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+*.spec~
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# 機密情報 - GitHubにコミットしない
+config.yaml
+config.local.yaml
+*.db
+*.sqlite
+*.sqlite3
+
+# 振込元データ、取引先データ、出力物
+sample/
+PDF/
+output/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml

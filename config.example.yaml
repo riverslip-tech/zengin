@@ -1,0 +1,26 @@
+# これを config.yaml にコピーして、実値を入れてください。
+# config.yaml は .gitignore でリポジトリから除外されます。
+
+# 依頼人（振込元）情報
+consignor:
+  code: "0000000000"          # 委託者コード (10桁、銀行から付与される番号)
+  name: "ｶ)ｱｲｳｴｵ"            # 委託者名 (半角カナ40桁以内)
+
+# 振込元口座情報
+source:
+  bank_code: "0000"           # 仕向銀行コード (4桁)
+  bank_name: "ﾐｽﾞﾎ"          # 仕向銀行名 (半角カナ15桁以内)
+  branch_code: "000"          # 仕向支店コード (3桁)
+  branch_name: "ﾎﾝﾃﾝ"        # 仕向支店名 (半角カナ15桁以内)
+  account_type: "1"           # 預金種目 (1:普通, 2:当座)
+  account_number: "0000000"   # 口座番号 (7桁)
+
+# 既定の振込日 (MMDD形式、UIで上書き可能)
+transfer_date: "0101"
+
+# Claude API設定
+# - api_key はここに書かずに、環境変数 ANTHROPIC_API_KEY または
+#   Streamlit Cloud の Secrets に "ANTHROPIC_API_KEY" として設定するのが推奨
+claude:
+  model: "claude-sonnet-4-6"
+  api_key: ""
