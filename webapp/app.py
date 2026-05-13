@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import os
 import sys
 import tempfile
@@ -31,6 +32,7 @@ from zengin_converter.pdf_reader import read_pdf
 from zengin_converter.zengin_writer import generate_zengin
 
 import batch_db
+import consignor_db
 import payee_db
 
 
@@ -48,6 +50,11 @@ def get_db():
 @st.cache_resource(show_spinner=False)
 def get_batch_db():
     return batch_db.get_conn()
+
+
+@st.cache_resource(show_spinner=False)
+def get_consignor_db():
+    return consignor_db.get_conn()
 
 
 def invoice_from_payee_row(row, fallback_amount: int = 0) -> InvoiceData:
@@ -132,6 +139,21 @@ def load_config() -> dict:
     return {}
 
 
+def mmdd_to_date(mmdd: str | None) -> dt.date:
+    """'MMDD' 文字列を当年の date に変換。失敗時は今日を返す。"""
+    today = dt.date.today()
+    if mmdd and len(mmdd) == 4 and mmdd.isdigit():
+        try:
+            return dt.date(today.year, int(mmdd[:2]), int(mmdd[2:]))
+        except ValueError:
+            pass
+    return today
+
+
+def date_to_mmdd(d: dt.date) -> str:
+    return f"{d.month:02d}{d.day:02d}"
+
+
 def _resolve_app_password() -> str:
     """アプリ認証用のパスワードを Secrets / 環境変数 から取得する。
 
@@ -204,6 +226,12 @@ def save_config(data: dict) -> None:
 def init_state() -> None:
     if "config_data" not in st.session_state:
         st.session_state.config_data = load_config()
+    # 振込元マスタの初期データ投入（config.yaml から1件シード）
+    cconn = get_consignor_db()
+    consignor_db.seed_from_yaml_config(cconn, st.session_state.config_data)
+    if "current_consignor_id" not in st.session_state:
+        default = consignor_db.get_default(cconn)
+        st.session_state.current_consignor_id = default["consignor_id"] if default else None
     if "extracted_items" not in st.session_state:
         st.session_state["extracted_items"] = []
     if "zengin_bytes" not in st.session_state:
@@ -584,18 +612,104 @@ def render_quick_generate(
             )
 
 
+@st.dialog("マスタに登録")
+def register_payee_dialog(item_id: str) -> None:
+    """マスタ未登録の取引先を payees DB に追加するダイアログ。"""
+    items = st.session_state.get("extracted_items", [])
+    target = next((it for it in items if it["id"] == item_id), None)
+    if not target:
+        st.error("対象のアイテムが見つかりません")
+        return
+
+    inv = get_current_invoice_for_item(target)
+
+    st.caption("PDFから抽出された情報をマスタに登録します。")
+    st.markdown(
+        f"- **受取人カナ**: {to_halfwidth_kana(inv.payee_name) or '（未入力）'}\n"
+        f"- **銀行 / 支店**: {inv.bank_name or '？'} / {inv.branch_name or '？'} "
+        f"({inv.bank_code or '----'} / {inv.branch_code or '---'})\n"
+        f"- **種目 / 口座**: {inv.account_type} / {inv.account_number or '（未入力）'}"
+    )
+
+    if not (inv.bank_code and inv.branch_code and inv.account_number):
+        st.error("銀行・支店・口座番号が未入力のため登録できません。先に振込情報を完成させてください。")
+        return
+
+    st.divider()
+
+    # 取引先名・コード（漢字情報はPDFから取れていないので手入力）
+    default_name = to_halfwidth_kana(inv.payee_name) or ""
+    payee_name = st.text_input(
+        "取引先名（漢字推奨、空欄なら受取人カナを流用）",
+        value="",
+        placeholder=default_name,
+        key=f"reg_payee_name_{item_id}",
+    )
+    payee_kana = st.text_input(
+        "取引先カナ（全角カナ推奨、任意）",
+        value="",
+        key=f"reg_payee_kana_{item_id}",
+    )
+    payee_code = st.text_input(
+        "取引先コード（任意）",
+        value="",
+        key=f"reg_payee_code_{item_id}",
+    )
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("登録", type="primary", use_container_width=True, key=f"reg_submit_{item_id}"):
+            conn = get_db()
+            payee_kana_value = payee_kana.strip()
+            payee_name_value = payee_name.strip() or default_name
+            new_key = payee_db.insert_manual(conn, {
+                "payee_code": payee_code.strip(),
+                "payee_name": payee_name_value,
+                "payee_name_kana": payee_kana_value,
+                "bank_name": inv.bank_name or "",
+                "bank_code": inv.bank_code or "",
+                "branch_name": inv.branch_name or "",
+                "branch_code": inv.branch_code or "",
+                "account_type": inv.account_type or "普通",
+                "account_number": inv.account_number or "",
+                "holder_name": payee_name_value,
+                "holder_kana": to_halfwidth_kana(inv.payee_name) or "",
+                "note": "PDF抽出から登録",
+            })
+            # この item をマッチ済みにマーク
+            target["matched_payee_key"] = new_key
+            save_current_batch_to_db(from_widgets=True)
+            st.session_state["_just_registered"] = payee_name_value
+            st.rerun()
+    with c2:
+        if st.button("キャンセル", use_container_width=True, key=f"reg_cancel_{item_id}"):
+            st.rerun()
+
+
 def render_item_editor(idx: int, item: dict[str, Any]) -> None:
     """1件分のプレビュー + 編集フォームを左右に並べて表示。"""
     item_id = item["id"]
     inv: InvoiceData = item["invoice"]
 
+    is_matched = bool(item.get("matched_payee_key"))
     with st.container(border=True):
-        header_col, del_col = st.columns([5, 1])
+        header_col, action_col, del_col = st.columns([4, 1, 1])
         with header_col:
-            matched_badge = "  ✦ マスタ一致" if item.get("matched_payee_key") else ""
+            matched_badge = "  ✦ マスタ一致" if is_matched else "  ⊕ マスタ未登録"
             st.markdown(
                 f"**#{idx + 1}　{item['filename']}**  ({item['page_count']}ページ){matched_badge}"
             )
+        with action_col:
+            if not is_matched:
+                if st.button(
+                    "マスタに登録",
+                    key=f"reg_btn_{item_id}",
+                    use_container_width=True,
+                    help="この振込先情報を取引先マスタに保存します",
+                ):
+                    register_payee_dialog(item_id)
+            else:
+                st.write("")  # 空のスペーサー
         with del_col:
             if st.button("行を削除", key=f"del_{item_id}", use_container_width=True):
                 st.session_state["extracted_items"] = [
@@ -861,6 +975,40 @@ def render_convert_tab() -> None:
         key="uploader",
     )
 
+    # 振込元プルダウン
+    cconn = get_consignor_db()
+    consignors = consignor_db.list_all(cconn)
+    col_src, _ = st.columns([2, 1])
+    with col_src:
+        if not consignors:
+            st.warning("振込元が未登録です。「振込元設定」タブから登録してください。")
+            selected_consignor_id = None
+        else:
+            options = [c["consignor_id"] for c in consignors]
+            labels = {
+                c["consignor_id"]: (
+                    f"{c['name']}  /  {c['bank_name']} {c['branch_name']} "
+                    f"{c['account_number']}"
+                    + ("  ⭐デフォルト" if c["is_default"] else "")
+                )
+                for c in consignors
+            }
+            current = st.session_state.get("current_consignor_id")
+            try:
+                index = options.index(current) if current in options else 0
+            except ValueError:
+                index = 0
+            selected_consignor_id = st.selectbox(
+                "振込元（複数登録できます）",
+                options=options,
+                format_func=lambda x: labels[x],
+                index=index,
+                key="conv_consignor_sel",
+            )
+            if selected_consignor_id != current:
+                st.session_state.current_consignor_id = selected_consignor_id
+                st.rerun()
+
     col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
         transfer_type = st.selectbox(
@@ -870,12 +1018,13 @@ def render_convert_tab() -> None:
             key="conv_transfer_type",
         )
     with col2:
-        transfer_date = st.text_input(
-            "振込日 (MMDD)",
-            value=cfg.get("transfer_date", "0101"),
-            max_chars=4,
-            key="conv_transfer_date",
+        picked_date = st.date_input(
+            "振込日",
+            value=mmdd_to_date(cfg.get("transfer_date", "")),
+            format="YYYY/MM/DD",
+            key="conv_transfer_date_picker",
         )
+        transfer_date = date_to_mmdd(picked_date)
     with col3:
         output_filename = st.text_input(
             "出力ファイル名",
@@ -944,8 +1093,21 @@ def render_convert_tab() -> None:
         )
 
     if st.session_state["extracted_items"]:
+        # 登録直後のトースト
+        just = st.session_state.pop("_just_registered", None)
+        if just:
+            st.toast(f"✅ マスタに登録しました: {just}", icon="📒")
+
+        total_items = len(st.session_state["extracted_items"])
+        unmatched = sum(
+            1 for it in st.session_state["extracted_items"] if not it.get("matched_payee_key")
+        )
+        unmatched_note = (
+            f"　— **{unmatched} 件がマスタ未登録**（各アイテムの「マスタに登録」ボタンから追加できます）"
+            if unmatched else "　— **全件マスタ一致** ✦"
+        )
         st.markdown(
-            f"**抽出済み: {len(st.session_state['extracted_items'])}件**　— "
+            f"**抽出済み: {total_items}件**{unmatched_note}　— "
             "下記の一覧またはプレビュー横のフォームで修正できます。"
         )
 
@@ -1147,25 +1309,38 @@ def run_generation(
     transfer_date: str,
     output_filename: str,
 ) -> None:
-    consignor = cfg.get("consignor", {}) or {}
-    source = cfg.get("source", {}) or {}
+    # 現在選択中の振込元を取得
+    cconn = get_consignor_db()
+    consignor_id = st.session_state.get("current_consignor_id")
+    if not consignor_id:
+        st.error("振込元が選択されていません。「振込元設定」タブで登録・選択してください。")
+        return
+
+    consignor_row = consignor_db.get(cconn, consignor_id)
+    if not consignor_row:
+        st.error("選択中の振込元が見つかりません。再選択してください。")
+        return
 
     missing = []
-    for key, label in [("code", "委託者コード"), ("name", "委託者名")]:
-        if not consignor.get(key):
-            missing.append(f"振込元設定の「{label}」")
-    for key, label in [
+    required = [
+        ("consignor_code", "委託者コード"),
+        ("consignor_name", "委託者名"),
         ("bank_code", "仕向銀行コード"),
         ("bank_name", "仕向銀行名"),
         ("branch_code", "仕向支店コード"),
         ("branch_name", "仕向支店名"),
         ("account_number", "口座番号"),
-    ]:
-        if not source.get(key):
-            missing.append(f"振込元設定の「{label}」")
+    ]
+    for key, label in required:
+        if not (consignor_row[key] or "").strip():
+            missing.append(label)
 
     if missing:
-        st.error("振込元設定が未入力です: " + ", ".join(missing) + "（「振込元設定」タブで入力してください）")
+        st.error(
+            "振込元「" + consignor_row["name"] + "」の必須項目が未入力です: "
+            + ", ".join(missing)
+            + "（「振込元設定」タブで編集してください）"
+        )
         return
 
     # 各itemの編集後ウィジェット値からInvoiceDataを構築
@@ -1199,14 +1374,14 @@ def run_generation(
         )
 
     config = ConsignorConfig(
-        consignor_code=consignor["code"],
-        consignor_name=consignor["name"],
-        bank_code=source["bank_code"],
-        bank_name=source["bank_name"],
-        branch_code=source["branch_code"],
-        branch_name=source["branch_name"],
-        account_type=source.get("account_type", "1"),
-        account_number=source["account_number"],
+        consignor_code=consignor_row["consignor_code"],
+        consignor_name=consignor_row["consignor_name"],
+        bank_code=consignor_row["bank_code"],
+        bank_name=consignor_row["bank_name"],
+        branch_code=consignor_row["branch_code"],
+        branch_name=consignor_row["branch_name"],
+        account_type=consignor_row["account_type"] or "1",
+        account_number=consignor_row["account_number"],
         transfer_date=transfer_date,
     )
 
@@ -1525,67 +1700,272 @@ def render_master_tab() -> None:
                 st.rerun()
 
 
+def _render_consignor_form(
+    prefix: str,
+    initial: dict,
+    submit_label: str,
+    show_default_checkbox: bool = True,
+) -> dict | None:
+    """振込元の入力フォーム（追加・編集兼用）。Submitされたときに dict、それ以外は None。
+
+    仕向銀行・支店は zengin-code 由来のプルダウンで選択し、コードと半角カナ名は自動表示する。
+    """
+    from zengin_converter.bank_resolver import get_bank_name_kana, get_branch_name_kana
+
+    c1, c2 = st.columns(2)
+    with c1:
+        f_name = st.text_input(
+            "表示名（社内識別用）*",
+            value=initial.get("name", ""),
+            key=f"{prefix}_name",
+            help="例: メイン口座、関連会社A、給与振込用 など",
+        )
+        f_consignor_code = st.text_input(
+            "委託者コード (10桁) *", value=initial.get("consignor_code", ""),
+            max_chars=10, key=f"{prefix}_consignor_code",
+        )
+        f_consignor_name = st.text_input(
+            "委託者名 (半角カナ40桁以内) *",
+            value=initial.get("consignor_name", ""),
+            max_chars=40, key=f"{prefix}_consignor_name",
+        )
+
+        # 仕向銀行プルダウン
+        banks = get_bank_options()
+        bank_labels = ["（選択してください）"] + [f"{c}  {n}" for c, n in banks]
+        default_bank_idx = resolve_bank_index(initial.get("bank_code"), initial.get("bank_name"))
+        bank_idx_value = (default_bank_idx + 1) if default_bank_idx is not None else 0
+        bank_sel = st.selectbox(
+            "仕向銀行 *",
+            options=list(range(len(bank_labels))),
+            format_func=lambda i: bank_labels[i],
+            index=bank_idx_value,
+            key=f"{prefix}_bank_sel",
+            help="銀行名・カナ・コードでタイプ検索できます",
+        )
+        sel_bank_code, sel_bank_name_kana = ("", "")
+        if bank_sel > 0:
+            sel_bank_code, _ = banks[bank_sel - 1]
+            sel_bank_name_kana = get_bank_name_kana(sel_bank_code) or ""
+
+        bc1, bc2 = st.columns([1, 2])
+        with bc1:
+            st.text_input(
+                "銀行コード", value=sel_bank_code, disabled=True,
+                key=f"{prefix}_bank_code_display",
+            )
+        with bc2:
+            st.text_input(
+                "銀行名（半角カナ）", value=sel_bank_name_kana, disabled=True,
+                key=f"{prefix}_bank_name_display",
+            )
+    with c2:
+        # 仕向支店プルダウン
+        sel_branch_code, sel_branch_name_kana = ("", "")
+        if sel_bank_code:
+            branches = get_branch_options(sel_bank_code)
+            branch_labels = ["（選択してください）"] + [f"{c}  {n}" for c, n in branches]
+            default_branch_idx = resolve_branch_index(
+                sel_bank_code, initial.get("branch_code"), initial.get("branch_name")
+            )
+            branch_idx_value = (default_branch_idx + 1) if default_branch_idx is not None else 0
+            branch_sel = st.selectbox(
+                "仕向支店 *",
+                options=list(range(len(branch_labels))),
+                format_func=lambda i: branch_labels[i],
+                index=branch_idx_value,
+                key=f"{prefix}_branch_sel",
+                help="支店名・カナ・コードでタイプ検索できます",
+            )
+            if branch_sel > 0:
+                sel_branch_code, _ = branches[branch_sel - 1]
+                sel_branch_name_kana = get_branch_name_kana(sel_bank_code, sel_branch_code) or ""
+        else:
+            st.selectbox(
+                "仕向支店 *",
+                options=[0],
+                format_func=lambda i: "（先に銀行を選択してください）",
+                index=0,
+                disabled=True,
+                key=f"{prefix}_branch_sel_disabled",
+            )
+
+        brc1, brc2 = st.columns([1, 2])
+        with brc1:
+            st.text_input(
+                "支店コード", value=sel_branch_code, disabled=True,
+                key=f"{prefix}_branch_code_display",
+            )
+        with brc2:
+            st.text_input(
+                "支店名（半角カナ）", value=sel_branch_name_kana, disabled=True,
+                key=f"{prefix}_branch_name_display",
+            )
+
+        f_account_type = st.selectbox(
+            "預金種目 *",
+            options=["1", "2"],
+            index=0 if (initial.get("account_type") or "1") == "1" else 1,
+            format_func=lambda x: {"1": "1: 普通", "2": "2: 当座"}.get(x, x),
+            key=f"{prefix}_account_type",
+        )
+        f_account_number = st.text_input(
+            "口座番号 (7桁) *", value=initial.get("account_number", ""),
+            max_chars=7, key=f"{prefix}_account_number",
+        )
+        if show_default_checkbox:
+            f_is_default = st.checkbox(
+                "この振込元をデフォルトにする",
+                value=bool(initial.get("is_default")),
+                key=f"{prefix}_is_default",
+            )
+        else:
+            f_is_default = False
+
+    if st.button(submit_label, type="primary", key=f"{prefix}_submit"):
+        missing = []
+        for key, label in [
+            (f_name, "表示名"),
+            (f_consignor_code, "委託者コード"),
+            (f_consignor_name, "委託者名"),
+            (sel_bank_code, "仕向銀行"),
+            (sel_branch_code, "仕向支店"),
+            (f_account_number, "口座番号"),
+        ]:
+            if not key.strip():
+                missing.append(label)
+        if missing:
+            st.error("未入力: " + ", ".join(missing))
+            return None
+        return {
+            "name": f_name.strip(),
+            "consignor_code": f_consignor_code.strip(),
+            "consignor_name": f_consignor_name.strip(),
+            "bank_code": sel_bank_code,
+            "bank_name": sel_bank_name_kana,
+            "branch_code": sel_branch_code,
+            "branch_name": sel_branch_name_kana,
+            "account_type": f_account_type,
+            "account_number": f_account_number.strip(),
+            "is_default": f_is_default,
+        }
+    return None
+
+
 def render_config_tab() -> None:
     cfg = st.session_state.config_data
-    consignor = cfg.get("consignor", {}) or {}
-    source = cfg.get("source", {}) or {}
     claude_cfg = cfg.get("claude", {}) or {}
+    cconn = get_consignor_db()
+    rows = consignor_db.list_all(cconn)
 
-    st.subheader("振込元（委託者）情報")
-    col1, col2 = st.columns(2)
-    with col1:
-        new_consignor_code = st.text_input("委託者コード (10桁)", value=consignor.get("code", ""), key="cfg_consignor_code")
-        new_bank_code = st.text_input("仕向銀行コード (4桁)", value=source.get("bank_code", ""), key="cfg_bank_code")
-        new_branch_code = st.text_input("仕向支店コード (3桁)", value=source.get("branch_code", ""), key="cfg_branch_code")
-        new_account_type = st.selectbox(
-            "預金種目",
-            options=["1", "2"],
-            index=0 if source.get("account_type", "1") == "1" else 1,
-            format_func=lambda x: {"1": "1: 普通", "2": "2: 当座"}.get(x, x),
-            key="cfg_account_type",
+    st.subheader(f"振込元（委託者）情報 — {len(rows)} 件登録")
+    st.caption("複数の振込元を登録できます。変換タブ上部のプルダウンから切り替えてください。")
+
+    # 一覧表示
+    if rows:
+        for r in rows:
+            mark = "⭐ " if r["is_default"] else "　"
+            with st.container(border=True):
+                hc1, hc2 = st.columns([5, 1])
+                with hc1:
+                    st.markdown(
+                        f"**{mark}{r['name']}**　"
+                        f"／ 委託者: {r['consignor_name']} ({r['consignor_code']})  "
+                        f"／ 口座: {r['bank_name']} {r['branch_name']} "
+                        f"({r['bank_code']}-{r['branch_code']}) "
+                        f"{'普通' if r['account_type'] == '1' else '当座'} "
+                        f"{r['account_number']}"
+                    )
+                with hc2:
+                    if not r["is_default"]:
+                        if st.button("デフォルトに設定", key=f"set_default_{r['consignor_id']}",
+                                     use_container_width=True):
+                            consignor_db.set_default(cconn, r["consignor_id"])
+                            st.session_state.current_consignor_id = r["consignor_id"]
+                            st.rerun()
+
+                with st.expander("編集 / 削除", expanded=False):
+                    edited = _render_consignor_form(
+                        prefix=f"edit_consignor_{r['consignor_id']}",
+                        initial=dict(r),
+                        submit_label="保存",
+                    )
+                    if edited:
+                        consignor_db.update(cconn, r["consignor_id"], edited)
+                        if edited["is_default"]:
+                            st.session_state.current_consignor_id = r["consignor_id"]
+                        st.success("更新しました")
+                        st.rerun()
+                    if len(rows) > 1:
+                        if st.button("この振込元を削除", key=f"delete_consignor_{r['consignor_id']}"):
+                            consignor_db.delete(cconn, r["consignor_id"])
+                            if st.session_state.get("current_consignor_id") == r["consignor_id"]:
+                                new_default = consignor_db.get_default(cconn)
+                                st.session_state.current_consignor_id = (
+                                    new_default["consignor_id"] if new_default else None
+                                )
+                            st.success("削除しました")
+                            st.rerun()
+    else:
+        st.info("振込元が未登録です。下の「新規登録」から最初の振込元を追加してください。")
+
+    # 新規登録
+    with st.expander("➕ 新規振込元を登録", expanded=(not rows)):
+        new_row = _render_consignor_form(
+            prefix="new_consignor",
+            initial={"is_default": not rows},  # 最初の1件は自動でデフォルト
+            submit_label="登録",
         )
-    with col2:
-        new_consignor_name = st.text_input("委託者名 (半角カナ)", value=consignor.get("name", ""), key="cfg_consignor_name")
-        new_bank_name = st.text_input("仕向銀行名 (半角カナ)", value=source.get("bank_name", ""), key="cfg_bank_name")
-        new_branch_name = st.text_input("仕向支店名 (半角カナ)", value=source.get("branch_name", ""), key="cfg_branch_name")
-        new_account_number = st.text_input("口座番号 (7桁)", value=source.get("account_number", ""), key="cfg_account_number")
+        if new_row:
+            new_id = consignor_db.insert(cconn, new_row)
+            if new_row["is_default"]:
+                st.session_state.current_consignor_id = new_id
+            st.success("登録しました")
+            st.rerun()
+
+    st.divider()
 
     st.subheader("既定の振込日")
-    new_transfer_date = st.text_input(
-        "振込日 (MMDD)", value=cfg.get("transfer_date", "0101"), max_chars=4,
-        key="cfg_transfer_date",
+    cfg_picked = st.date_input(
+        "振込日（次回の起動時に変換タブの初期値になります）",
+        value=mmdd_to_date(cfg.get("transfer_date", "")),
+        format="YYYY/MM/DD",
+        key="cfg_transfer_date_picker",
     )
+    new_transfer_date = date_to_mmdd(cfg_picked)
 
-    st.subheader("Claude API")
+    st.subheader("Claude API（ローカル開発用）")
+    st.caption(
+        "Streamlit Cloud では Secrets に `ANTHROPIC_API_KEY` を設定してください。"
+        "ここで保存した値は config.yaml にのみ保存され、リポジトリには含まれません。"
+    )
     new_model = st.text_input("モデル", value=claude_cfg.get("model", DEFAULT_MODEL), key="cfg_model")
     new_api_key = st.text_input(
-        "APIキー (config.yamlに平文保存されます)",
+        "APIキー (config.yamlにのみ保存)",
         value=claude_cfg.get("api_key", ""),
         type="password",
         key="cfg_api_key",
     )
 
-    st.divider()
-    if st.button("config.yaml に保存", type="primary"):
-        new_cfg = {
-            "consignor": {
-                "code": new_consignor_code,
-                "name": new_consignor_name,
-            },
-            "source": {
-                "bank_code": new_bank_code,
-                "bank_name": new_bank_name,
-                "branch_code": new_branch_code,
-                "branch_name": new_branch_name,
-                "account_type": new_account_type,
-                "account_number": new_account_number,
-            },
-            "transfer_date": new_transfer_date,
-            "claude": {
-                "model": new_model,
-                "api_key": new_api_key,
-            },
-        }
+    if st.button("振込日・APIキーを config.yaml に保存", key="cfg_save_yaml"):
+        new_cfg = dict(cfg)
+        new_cfg["transfer_date"] = new_transfer_date
+        new_cfg["claude"] = {"model": new_model, "api_key": new_api_key}
+        # consignor/source は consignor_db で管理するため、互換のため最新デフォルトを書き出す
+        default_row = consignor_db.get_default(cconn)
+        if default_row:
+            new_cfg["consignor"] = {
+                "code": default_row["consignor_code"],
+                "name": default_row["consignor_name"],
+            }
+            new_cfg["source"] = {
+                "bank_code": default_row["bank_code"],
+                "bank_name": default_row["bank_name"],
+                "branch_code": default_row["branch_code"],
+                "branch_name": default_row["branch_name"],
+                "account_type": default_row["account_type"],
+                "account_number": default_row["account_number"],
+            }
         save_config(new_cfg)
         st.session_state.config_data = new_cfg
         st.success(f"保存しました: {CONFIG_PATH}")
