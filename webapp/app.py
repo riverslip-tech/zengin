@@ -132,6 +132,46 @@ def load_config() -> dict:
     return {}
 
 
+def _resolve_app_password() -> str:
+    """アプリ認証用のパスワードを Secrets / 環境変数 から取得する。
+
+    どちらにも設定されていない場合は空文字を返し、認証ゲートはスキップされる
+    （ローカル開発時はパスワードなしで動作）。
+    """
+    try:
+        val = (st.secrets.get("APP_PASSWORD") or "").strip()
+        if val:
+            return val
+    except Exception:
+        pass
+    return (os.environ.get("APP_PASSWORD") or "").strip()
+
+
+def require_password() -> None:
+    """Secrets/環境変数に APP_PASSWORD が設定されているときだけ認証ゲートを表示する。"""
+    expected = _resolve_app_password()
+    if not expected:
+        return  # 設定なし → ローカル開発として認証スキップ
+    if st.session_state.get("_authed"):
+        return
+
+    st.set_page_config(page_title="全銀フォーマット変換ツール", page_icon="🔐", layout="centered")
+    st.title("🔐 全銀フォーマット変換ツール")
+    st.caption("利用にはパスワードが必要です。")
+
+    with st.form("password_form", clear_on_submit=False):
+        pw = st.text_input("パスワード", type="password", label_visibility="collapsed")
+        submitted = st.form_submit_button("ログイン", type="primary", use_container_width=True)
+
+    if submitted:
+        if pw == expected:
+            st.session_state["_authed"] = True
+            st.rerun()
+        else:
+            st.error("パスワードが違います")
+    st.stop()
+
+
 def _resolve_api_key(claude_cfg: dict) -> str:
     """API キーを config.yaml → 環境変数 → Streamlit Secrets の順で解決する。
 
@@ -1552,6 +1592,7 @@ def render_config_tab() -> None:
 
 
 def main() -> None:
+    require_password()
     st.set_page_config(page_title="全銀フォーマット変換ツール", page_icon="🏦", layout="wide")
     init_state()
 
