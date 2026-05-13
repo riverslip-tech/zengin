@@ -257,6 +257,12 @@ def clear_item_widget_keys() -> None:
 def load_batch_into_state(batch_id: str) -> None:
     """DBからバッチを読み出して session_state['extracted_items'] に展開する。"""
     bconn = get_batch_db()
+    # バッチに紐付いた振込元があれば現在選択を切り替え
+    batch_row = batch_db.get_batch(bconn, batch_id)
+    if batch_row and batch_row["consignor_id"]:
+        cconn = get_consignor_db()
+        if consignor_db.get(cconn, batch_row["consignor_id"]):
+            st.session_state.current_consignor_id = batch_row["consignor_id"]
     rows = batch_db.list_items(bconn, batch_id)
     new_items: list[dict[str, Any]] = []
     for r in rows:
@@ -851,8 +857,19 @@ def render_item_editor(idx: int, item: dict[str, Any]) -> None:
 def render_batch_manager() -> None:
     """変換タブ上部のバッチ選択・新規作成・リネーム UI。"""
     bconn = get_batch_db()
+    cconn = get_consignor_db()
     batches = batch_db.list_batches(bconn)
     current_id = st.session_state.get("current_batch_id")
+
+    # consignor_id → 表示名 のキャッシュ
+    consignors_map: dict[str, str] = {}
+    for c in consignor_db.list_all(cconn):
+        consignors_map[c["consignor_id"]] = c["name"]
+
+    def _format_consignor(cid: str | None) -> str:
+        if not cid:
+            return "（振込元未設定）"
+        return consignors_map.get(cid, "（削除済み振込元）")
 
     # 現在のバッチ情報
     current_row = None
@@ -868,7 +885,8 @@ def render_batch_manager() -> None:
         if current_row:
             badge = (
                 f"**現在のバッチ:** {current_row['name']}　"
-                f"（{current_row['item_count']}件 / 合計 {current_row['total_amount']:,}円）"
+                f"（{current_row['item_count']}件 / 合計 {current_row['total_amount']:,}円　／　"
+                f"振込元: {_format_consignor(current_row['consignor_id'])}）"
             )
         else:
             badge = "**現在のバッチ:** *未作成*（PDFを抽出すると自動的に作成されます）"
@@ -883,7 +901,8 @@ def render_batch_manager() -> None:
                 labels = {
                     b["batch_id"]: (
                         f"{b['name']}  —  {b['item_count']}件 / "
-                        f"{b['total_amount']:,}円  ({b['updated_at']})"
+                        f"{b['total_amount']:,}円  "
+                        f"({_format_consignor(b['consignor_id'])})"
                     )
                     for b in batches
                 }
@@ -1007,6 +1026,13 @@ def render_convert_tab() -> None:
             )
             if selected_consignor_id != current:
                 st.session_state.current_consignor_id = selected_consignor_id
+                # 現在のバッチがあれば、そのバッチにも紐付ける
+                current_batch_id = st.session_state.get("current_batch_id")
+                if current_batch_id:
+                    batch_db.update_batch_meta(
+                        get_batch_db(), current_batch_id,
+                        consignor_id=selected_consignor_id,
+                    )
                 st.rerun()
 
     col1, col2, col3 = st.columns([1, 1, 1])
@@ -1293,7 +1319,8 @@ def run_extraction(
             st.session_state["extracted_items"] = new_items
             st.session_state.zengin_bytes = None
             batch_id = batch_db.create_batch(
-                bconn, transfer_date=transfer_date or None, transfer_type=transfer_type
+                bconn, transfer_date=transfer_date or None, transfer_type=transfer_type,
+                consignor_id=st.session_state.get("current_consignor_id"),
             )
             st.session_state.current_batch_id = batch_id
             save_current_batch_to_db(from_widgets=False)

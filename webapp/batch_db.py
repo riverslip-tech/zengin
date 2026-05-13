@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS batches (
     name            TEXT NOT NULL,
     transfer_date   TEXT,
     transfer_type   TEXT DEFAULT '総合振込',
+    consignor_id    TEXT,
     created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
 );
@@ -54,6 +55,12 @@ def get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    # 既存DBに consignor_id カラムが無ければ追加（マイグレーション）
+    try:
+        conn.execute("ALTER TABLE batches ADD COLUMN consignor_id TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # 既に存在
     return conn
 
 
@@ -84,6 +91,7 @@ def create_batch(
     transfer_date: str | None,
     transfer_type: str = "総合振込",
     name: str | None = None,
+    consignor_id: str | None = None,
 ) -> str:
     """新しいバッチを作成し、batch_id を返す。同名があれば自動で連番を付ける。"""
     base = name or auto_batch_name(transfer_date)
@@ -98,9 +106,9 @@ def create_batch(
 
     batch_id = uuid.uuid4().hex
     conn.execute(
-        """INSERT INTO batches (batch_id, name, transfer_date, transfer_type)
-           VALUES (?, ?, ?, ?)""",
-        (batch_id, final_name, transfer_date or "", transfer_type),
+        """INSERT INTO batches (batch_id, name, transfer_date, transfer_type, consignor_id)
+           VALUES (?, ?, ?, ?, ?)""",
+        (batch_id, final_name, transfer_date or "", transfer_type, consignor_id),
     )
     conn.commit()
     return batch_id
@@ -121,6 +129,7 @@ def update_batch_meta(
     batch_id: str,
     transfer_date: str | None = None,
     transfer_type: str | None = None,
+    consignor_id: str | None = None,
 ) -> None:
     sets, vals = [], []
     if transfer_date is not None:
@@ -129,6 +138,9 @@ def update_batch_meta(
     if transfer_type is not None:
         sets.append("transfer_type = ?")
         vals.append(transfer_type)
+    if consignor_id is not None:
+        sets.append("consignor_id = ?")
+        vals.append(consignor_id)
     if not sets:
         return
     sets.append("updated_at = CURRENT_TIMESTAMP")
